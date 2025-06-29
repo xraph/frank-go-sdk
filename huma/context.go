@@ -3,6 +3,7 @@ package huma
 import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/xid"
+	"github.com/xraph/frank-go-sdk"
 )
 
 // Huma context helpers
