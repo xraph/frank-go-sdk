@@ -50,37 +50,22 @@ jobs:
       - name: Check if this is a release commit
         id: check-release-commit
         run: |
-          # Get the commit message - be very explicit about this
           latest_commit_message=$(git log -1 --pretty=format:"%s")
-          echo "=== COMMIT MESSAGE DEBUG ==="
-          echo "Raw commit message: '$latest_commit_message'"
-          echo "Message length: ${#latest_commit_message}"
-          echo "=========================="
-          
-          # More robust pattern matching
-          if echo "$latest_commit_message" | grep -E "^chore: prepare release v[0-9]+\.[0-9]+\.[0-9]+"; then
-            echo "✅ DETECTED: This is a release commit"
+          echo "Latest commit: $latest_commit_message"
+
+          # Check if this is a release preparation commit
+          if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             echo "is_release_commit=true" >> $GITHUB_OUTPUT
-          
-            # Extract version more carefully
-            version=$(echo "$latest_commit_message" | sed -n 's/^chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')
+            version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
             echo "release_version=$version" >> $GITHUB_OUTPUT
-            echo "Extracted version: $version"
-          
-            # Set should_release to false to prevent PR creation
-            echo "This is a release commit - setting should_release=false"
-          
+            echo "This is a release commit for version $version"
+
+            # Exit early - don't need to check other things for release commits
+            exit 0
           else
-            echo "❌ NOT DETECTED: This is not a release commit"
             echo "is_release_commit=false" >> $GITHUB_OUTPUT
-            echo "Will check if we need to create a release PR"
+            echo "This is not a release commit"
           fi
-          
-          # Debug: Show what we're outputting
-          echo "=== OUTPUTS ==="
-          echo "is_release_commit: $(cat $GITHUB_OUTPUT | grep is_release_commit || echo 'not set')"
-          echo "release_version: $(cat $GITHUB_OUTPUT | grep release_version || echo 'not set')"
-          echo "==============="
 
       # Only run the following steps if this is NOT a release commit
       - name: Setup Go
