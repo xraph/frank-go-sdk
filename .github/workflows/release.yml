@@ -32,8 +32,7 @@ jobs:
     if: |
       !contains(github.event.head_commit.message, '[skip release]') &&
       !contains(github.event.head_commit.message, '[release skip]') &&
-      !contains(github.event.head_commit.message, '[skip ci]') &&
-      !startsWith(github.event.head_commit.message, 'chore: prepare release')
+      !contains(github.event.head_commit.message, '[skip ci]')
     outputs:
       should_release: ${{ steps.check-changes.outputs.should_release }}
       version: ${{ steps.version.outputs.version }}
@@ -41,6 +40,7 @@ jobs:
       pr_exists: ${{ steps.find-pr.outputs.pr_exists }}
       existing_version: ${{ steps.find-pr.outputs.existing_version }}
       is_release_commit: ${{ steps.check-release-commit.outputs.is_release_commit }}
+      release_version: ${{ steps.check-release-commit.outputs.release_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,6 +60,9 @@ jobs:
             version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
             echo "release_version=$version" >> $GITHUB_OUTPUT
             echo "This is a release commit for version $version"
+          
+            # Exit early if this is a release commit - no need to check other things
+            exit 0
           else
             echo "is_release_commit=false" >> $GITHUB_OUTPUT
             echo "This is not a release commit"
