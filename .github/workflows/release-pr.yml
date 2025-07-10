@@ -13,7 +13,7 @@ permissions:
 jobs:
   check-release-pr:
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.labels.*.name, 'release')
+    if: contains(github.event.pull_request.labels.*.name, 'release') || contains(github.event.pull_request.title, 'Release v')
     outputs:
       is_release_pr: ${{ steps.check-pr.outputs.is_release_pr }}
       version: ${{ steps.check-pr.outputs.version }}
@@ -21,6 +21,7 @@ jobs:
       - name: Check if this is a release PR
         id: check-pr
         run: |
+          # Check by title pattern or release label
           if [[ "${{ github.event.pull_request.title }}" =~ ^Release\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "is_release_pr=true" >> $GITHUB_OUTPUT
             version=$(echo "${{ github.event.pull_request.title }}" | sed 's/Release v//')
@@ -30,6 +31,23 @@ jobs:
             echo "is_release_pr=false" >> $GITHUB_OUTPUT
             echo "Not a release PR"
           fi
+
+      - name: Ensure release label exists and is applied
+        if: steps.check-pr.outputs.is_release_pr == 'true'
+        run: |
+          # Ensure the release label exists
+          if ! gh label list --search "release" --limit 1 | grep -q "release"; then
+            echo "Creating 'release' label..."
+            gh label create "release" --description "Automated release PR" --color "0e8a16"
+          fi
+          
+          # Add the release label if it's not already present
+          if ! echo "${{ join(github.event.pull_request.labels.*.name, ' ') }}" | grep -q "release"; then
+            echo "Adding release label to PR..."
+            gh pr edit ${{ github.event.pull_request.number }} --add-label "release"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   validate-release:
     needs: check-release-pr
@@ -326,18 +344,22 @@ jobs:
       needs.security-scan.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      - name: Create ready-to-merge label if needed
+        run: |
+          # Ensure the ready-to-merge label exists
+          if ! gh label list --search "ready-to-merge" --limit 1 | grep -q "ready-to-merge"; then
+            echo "Creating 'ready-to-merge' label..."
+            gh label create "ready-to-merge" --description "Ready to be merged" --color "0e8a16"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Add ready-to-merge label
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              labels: ['ready-to-merge']
-            });
-            
-            console.log('✅ Added ready-to-merge label');
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "ready-to-merge"
+          echo "✅ Added ready-to-merge label"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Comment merge instructions
         uses: actions/github-script@v7

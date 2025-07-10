@@ -1,0 +1,274 @@
+name: Repository Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update existing labels'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  setup-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup repository labels
+        run: |
+          echo "Setting up repository labels..."
+          
+          # Define labels with colors and descriptions
+          declare -A labels=(
+            ["release"]="0e8a16:Automated release PR"
+            ["automated"]="0052cc:Automated by GitHub Actions"
+            ["ready-to-merge"]="0e8a16:Ready to be merged"
+            ["breaking-change"]="b60205:Contains breaking changes"
+            ["feature"]="a2eeef:New feature"
+            ["bugfix"]="d73a4a:Bug fix"
+            ["documentation"]="0075ca:Documentation changes"
+            ["maintenance"]="fef2c0:Maintenance and refactoring"
+            ["security"]="ee0701:Security-related changes"
+            ["performance"]="1d76db:Performance improvements"
+            ["testing"]="c5def5:Testing related changes"
+            ["ci/cd"]="f9d0c4:CI/CD pipeline changes"
+          )
+          
+          # Create or update labels
+          for label_name in "${!labels[@]}"; do
+            IFS=':' read -r color description <<< "${labels[$label_name]}"
+          
+            if gh label list --search "$label_name" --limit 1 | grep -q "$label_name"; then
+              if [ "${{ github.event.inputs.force_update }}" = "true" ]; then
+                echo "Updating label: $label_name"
+                gh label edit "$label_name" --color "$color" --description "$description"
+              else
+                echo "Label exists: $label_name (skipping)"
+              fi
+            else
+              echo "Creating label: $label_name"
+              gh label create "$label_name" --color "$color" --description "$description"
+            fi
+          done
+          
+          echo "✅ Repository labels setup complete"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup branch protection rules
+        run: |
+          echo "Setting up branch protection rules..."
+          
+          # Check if branch protection exists
+          if gh api repos/${{ github.repository }}/branches/main/protection --silent 2>/dev/null; then
+            echo "Branch protection already exists for main branch"
+          else
+            echo "Creating branch protection rules for main branch..."
+          
+            # Basic branch protection
+            gh api repos/${{ github.repository }}/branches/main/protection \
+              --method PUT \
+              --field required_status_checks='{"strict":true,"contexts":["Validate Release"]}' \
+              --field enforce_admins=false \
+              --field required_pull_request_reviews='{"required_approving_review_count":1,"dismiss_stale_reviews":true}' \
+              --field restrictions=null \
+              --field allow_force_pushes=false \
+              --field allow_deletions=false \
+              --silent || echo "⚠️  Could not set branch protection (insufficient permissions)"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release configuration
+        run: |
+          echo "Creating release configuration..."
+          
+          # Create .github directory if it doesn't exist
+          mkdir -p .github
+          
+          # Create release.yml if it doesn't exist
+          if [ ! -f .github/release.yml ]; then
+            cat > .github/release.yml << 'EOF'
+          # Configuration for automated releases
+          
+          # Release rules - determines version bump based on commit messages
+          release_rules:
+            - type: feat
+              release: minor
+            - type: fix
+              release: patch
+            - type: perf
+              release: patch
+            - type: refactor
+              release: patch
+            - type: docs
+              release: false
+            - type: ci
+              release: false
+            - type: test
+              release: false
+            - type: chore
+              release: false
+            - scope: breaking
+              release: major
+            - breaking: true
+              release: major
+          
+          # Changelog configuration
+          changelog:
+            categories:
+              - title: "🚀 Features"
+                labels: ["feature", "feat"]
+              - title: "🐛 Bug Fixes"
+                labels: ["bugfix", "fix"]
+              - title: "🚨 Breaking Changes"
+                labels: ["breaking-change", "breaking"]
+              - title: "⚡ Performance"
+                labels: ["performance", "perf"]
+              - title: "🔧 Maintenance"
+                labels: ["maintenance", "refactor", "chore"]
+              - title: "📚 Documentation"
+                labels: ["documentation", "docs"]
+              - title: "🧪 Testing"
+                labels: ["testing", "test"]
+          
+          # Files to update during release
+          files_to_update:
+            - file: "types.go"
+              pattern: 'const Version = ".*"'
+              replacement: 'const Version = "${version}"'
+            - file: "go.mod"
+              pattern: '// v.*'
+              replacement: '// v${version}'
+          EOF
+          
+            echo "✅ Created .github/release.yml"
+          else
+            echo "Release configuration already exists"
+          fi
+
+      - name: Create or update CHANGELOG.md
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            cat > CHANGELOG.md << 'EOF'
+          # Changelog
+          
+          All notable changes to this project will be documented in this file.
+          
+          The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+          and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+          
+          ## [Unreleased]
+          
+          ### Added
+          - Automated release system
+          - Comprehensive CI/CD pipeline
+          - Security scanning and validation
+          
+          ### Changed
+          - Initial repository setup
+          
+          ### Fixed
+          - N/A
+          
+          ### Removed
+          - N/A
+          
+          ### Security
+          - Added automated security scanning
+          EOF
+          
+            echo "✅ Created CHANGELOG.md"
+          else
+            echo "CHANGELOG.md already exists"
+          fi
+
+      - name: Create scripts directory
+        run: |
+          mkdir -p scripts
+          
+          # Make the release script executable if it exists
+          if [ -f scripts/release.sh ]; then
+            chmod +x scripts/release.sh
+            echo "✅ Made release script executable"
+          fi
+
+      - name: Validate current version
+        run: |
+          # Check if version is defined in types.go
+          if grep -q "const Version" types.go; then
+            version=$(grep "const Version" types.go | sed 's/.*Version = "\(.*\)".*/\1/')
+            echo "✅ Current version: $version"
+          else
+            echo "⚠️  Version not found in types.go"
+            echo "Please ensure 'const Version = \"x.y.z\"' is defined in types.go"
+          fi
+
+      - name: Setup summary
+        run: |
+          echo "## 🚀 Repository Setup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Completed Setup Tasks" >> $GITHUB_STEP_SUMMARY
+          echo "- Repository labels created/updated" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch protection rules configured" >> $GITHUB_STEP_SUMMARY
+          echo "- Release configuration created" >> $GITHUB_STEP_SUMMARY
+          echo "- CHANGELOG.md initialized" >> $GITHUB_STEP_SUMMARY
+          echo "- Scripts directory prepared" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔄 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review and commit any new configuration files" >> $GITHUB_STEP_SUMMARY
+          echo "2. Make some changes with conventional commit messages" >> $GITHUB_STEP_SUMMARY
+          echo "3. Push to main branch to trigger automated release detection" >> $GITHUB_STEP_SUMMARY
+          echo "4. Or manually trigger a release using the workflow dispatch" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🛠️ Manual Release" >> $GITHUB_STEP_SUMMARY
+          echo "You can also trigger a manual release:" >> $GITHUB_STEP_SUMMARY
+          echo "- Via GitHub Actions: Go to Actions → Release → Run workflow" >> $GITHUB_STEP_SUMMARY
+          echo "- Via script: \`./scripts/release.sh\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📚 Documentation" >> $GITHUB_STEP_SUMMARY
+          echo "See the release documentation for more details on how the automated release system works." >> $GITHUB_STEP_SUMMARY
+
+  commit-setup-files:
+    needs: setup-labels
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit setup files
+        run: |
+          # Add any new files created during setup
+          git add .github/release.yml || true
+          git add CHANGELOG.md || true
+          git add scripts/ || true
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No setup files to commit"
+          else
+            git commit -m "chore: setup automated release system
+
+            - Add release configuration
+            - Initialize CHANGELOG.md
+            - Prepare scripts directory
+            - Configure repository labels"
+          
+            git push origin main
+            echo "✅ Setup files committed and pushed"
+          fi

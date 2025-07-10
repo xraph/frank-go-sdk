@@ -280,6 +280,18 @@ jobs:
             git push origin ${{ env.branch_name }}
           fi
 
+      - name: Ensure release label exists
+        run: |
+          # Check if the release label exists, create it if not
+          if ! gh label list --search "release" --limit 1 | grep -q "release"; then
+            echo "Creating 'release' label..."
+            gh label create "release" --description "Automated release PR" --color "0e8a16"
+          else
+            echo "Release label already exists"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create or update release PR
         run: |
           version="${{ needs.prepare-release.outputs.version }}"
@@ -310,15 +322,14 @@ jobs:
               --body "$pr_body"
           else
             echo "Creating new release PR"
-            gh pr create \
+            pr_url=$(gh pr create \
               --title "$pr_title" \
               --body "$pr_body" \
               --base main \
-              --head ${{ env.branch_name }} \
-              --label "release"
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              --head ${{ env.branch_name }})
+          
+            # Add the label after creating the PR
+            pr_number=$(echo "$pr_url" | grep -o '[0-9]*
 
   create-release:
     runs-on: ubuntu-latest
@@ -421,3 +432,112 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  )
+  gh pr edit $pr_number --add-label "release"
+
+echo "Created release PR: $pr_url"
+  fi
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+create-release:
+  runs-on: ubuntu-latest
+  if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Check if this is a release merge
+      id: check-release
+      run: |
+        # Check if the latest commit is a release commit
+        latest_commit_message=$(git log -1 --pretty=format:"%s")
+        if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v//')
+          echo "is_release=true" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Detected release commit for version $version"
+        else
+          echo "is_release=false" >> $GITHUB_OUTPUT
+          echo "Not a release commit"
+        fi
+
+    - name: Setup Go
+      if: steps.check-release.outputs.is_release == 'true'
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Run tests
+      if: steps.check-release.outputs.is_release == 'true'
+      run: |
+        go mod download
+        go test ./...
+
+    - name: Build binaries
+      if: steps.check-release.outputs.is_release == 'true'
+      run: |
+        mkdir -p dist
+        
+        # Build for different architectures
+        GOOS=linux GOARCH=amd64 go build -o dist/frank-go-sdk-linux-amd64 ./...
+        GOOS=darwin GOARCH=amd64 go build -o dist/frank-go-sdk-darwin-amd64 ./...
+        GOOS=windows GOARCH=amd64 go build -o dist/frank-go-sdk-windows-amd64.exe ./...
+
+    - name: Extract changelog for release
+      if: steps.check-release.outputs.is_release == 'true'
+      id: changelog
+      run: |
+        version="${{ steps.check-release.outputs.version }}"
+        
+        # Extract changelog for this version
+        if [ -f CHANGELOG.md ]; then
+          # Find the section for this version
+          awk "/^# Changelog for v$version/,/^# Changelog for v[0-9]/ {if (!/^# Changelog for v[0-9]/ || /^# Changelog for v$version/) print}" CHANGELOG.md > release_notes.md
+        
+          # Remove the first line (version header) and clean up
+          tail -n +2 release_notes.md > release_notes_cleaned.md
+        
+          # If the file ends with another version header, remove it
+          if tail -n 1 release_notes_cleaned.md | grep -q "^# Changelog for v"; then
+            head -n -1 release_notes_cleaned.md > release_notes_final.md
+          else
+            mv release_notes_cleaned.md release_notes_final.md
+          fi
+        
+          echo "Release notes extracted for version $version"
+        else
+          echo "No changelog found, creating basic release notes"
+          echo "## Release v$version" > release_notes_final.md
+          echo "" >> release_notes_final.md
+          echo "Automated release with latest changes." >> release_notes_final.md
+        fi
+
+    - name: Create GitHub Release
+      if: steps.check-release.outputs.is_release == 'true'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ steps.check-release.outputs.version }}
+        name: Release v${{ steps.check-release.outputs.version }}
+        body_path: release_notes_final.md
+        files: |
+          dist/*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Clean up release branch
+      if: steps.check-release.outputs.is_release == 'true'
+      run: |
+        version="${{ steps.check-release.outputs.version }}"
+        branch_name="release/v$version"
+        
+        # Delete the release branch if it exists
+        if git show-ref --verify --quiet refs/remotes/origin/$branch_name; then
+          git push origin --delete $branch_name || echo "Branch already deleted"
+        fi
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
