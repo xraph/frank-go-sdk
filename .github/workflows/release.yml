@@ -31,6 +31,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       pr_number: ${{ steps.find-pr.outputs.pr_number }}
       pr_exists: ${{ steps.find-pr.outputs.pr_exists }}
+      existing_version: ${{ steps.find-pr.outputs.existing_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,7 +68,7 @@ jobs:
           # Check if there are any significant changes (not just CI/docs)
           if [ "$commits_since_release" -gt 0 ]; then
             if [ "$latest_tag" = "v0.0.0" ]; then
-              significant_changes=$(git log --oneline --grep="^feat\|^fix\|^refactor\|^perf\|BREAKING" --grep="^feat\|^fix\|^refactor\|^perf\|BREAKING" HEAD || echo "")
+              significant_changes=$(git log --oneline --grep="^feat\|^fix\|^refactor\|^perf\|BREAKING" HEAD || echo "")
             else
               significant_changes=$(git log --oneline --grep="^feat\|^fix\|^refactor\|^perf\|BREAKING" ${latest_tag}..HEAD || echo "")
             fi
@@ -87,14 +88,25 @@ jobs:
       - name: Find existing release PR
         id: find-pr
         run: |
-          pr_number=$(gh pr list --state open --label "release" --json number --jq '.[0].number // empty')
-          if [ -n "$pr_number" ]; then
-            echo "pr_exists=true" >> $GITHUB_OUTPUT
-            echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
-            echo "Found existing release PR: #$pr_number"
-          else
+          # Look for open PRs with release label
+          pr_data=$(gh pr list --state open --label "release" --json number,title,headRefName --limit 1)
+          
+          if [ "$pr_data" = "[]" ]; then
             echo "pr_exists=false" >> $GITHUB_OUTPUT
             echo "No existing release PR found"
+          else
+            pr_number=$(echo "$pr_data" | jq -r '.[0].number')
+            pr_title=$(echo "$pr_data" | jq -r '.[0].title')
+            branch_name=$(echo "$pr_data" | jq -r '.[0].headRefName')
+          
+            # Extract version from PR title (format: "Release vX.Y.Z")
+            existing_version=$(echo "$pr_title" | sed -n 's/^Release v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p')
+          
+            echo "pr_exists=true" >> $GITHUB_OUTPUT
+            echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
+            echo "existing_version=$existing_version" >> $GITHUB_OUTPUT
+            echo "branch_name=$branch_name" >> $GITHUB_OUTPUT
+            echo "Found existing release PR: #$pr_number (v$existing_version) on branch $branch_name"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -104,6 +116,7 @@ jobs:
         if: steps.check-changes.outputs.should_release == 'true'
         run: |
           latest_tag="${{ steps.latest-release.outputs.latest_tag }}"
+          existing_version="${{ steps.find-pr.outputs.existing_version }}"
           
           # Remove 'v' prefix if present
           current_version=${latest_tag#v}
@@ -111,6 +124,35 @@ jobs:
           # If no previous version, start with 1.0.0
           if [ "$current_version" = "0.0.0" ]; then
             current_version="1.0.0"
+          fi
+          
+          # If there's an existing release PR, use that version unless we need a higher one
+          if [ -n "$existing_version" ]; then
+            echo "Found existing release PR for version $existing_version"
+          
+            # Check if we need to bump the version higher based on new commits
+            latest_pr_commit=$(gh pr view ${{ steps.find-pr.outputs.pr_number }} --json commits --jq '.commits[-1].oid' || echo "")
+          
+            if [ -n "$latest_pr_commit" ]; then
+              # Check for commits since the PR was last updated
+              new_commits=$(git rev-list --count ${latest_pr_commit}..HEAD || echo "0")
+          
+              if [ "$new_commits" -gt 0 ]; then
+                echo "Found $new_commits new commits since last PR update"
+                # Use the existing version as base and potentially bump it
+                current_version="$existing_version"
+              else
+                echo "No new commits since last PR update, using existing version"
+                echo "version=$existing_version" >> $GITHUB_OUTPUT
+                echo "release_type=existing" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            else
+              echo "Using existing version from PR: $existing_version"
+              echo "version=$existing_version" >> $GITHUB_OUTPUT
+              echo "release_type=existing" >> $GITHUB_OUTPUT
+              exit 0
+            fi
           fi
           
           # Split version into parts
@@ -178,29 +220,61 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Create or update release branch
+      - name: Prepare release branch
         run: |
           version="${{ needs.prepare-release.outputs.version }}"
           branch_name="release/v$version"
-          
-          # Check if branch exists
-          if git show-ref --verify --quiet refs/heads/$branch_name; then
-            echo "Branch $branch_name already exists, checking out and updating"
-            git checkout $branch_name
-            git rebase main
-          else
-            echo "Creating new branch $branch_name"
-            git checkout -b $branch_name
-          fi
+          pr_exists="${{ needs.prepare-release.outputs.pr_exists }}"
           
           echo "branch_name=$branch_name" >> $GITHUB_ENV
+          
+          # Fetch all remote branches
+          git fetch origin
+          
+          if [ "$pr_exists" = "true" ]; then
+            echo "Updating existing release branch: $branch_name"
+          
+            # Check if the remote branch exists
+            if git ls-remote --heads origin "$branch_name" | grep -q "$branch_name"; then
+              echo "Remote branch exists, checking out and updating"
+              git checkout -B "$branch_name" "origin/$branch_name"
+          
+              # Reset to main and reapply changes to avoid conflicts
+              git reset --hard origin/main
+            else
+              echo "Remote branch doesn't exist, creating from main"
+              git checkout -b "$branch_name"
+            fi
+          else
+            echo "Creating new release branch: $branch_name"
+          
+            # Delete local branch if it exists
+            git branch -D "$branch_name" 2>/dev/null || true
+          
+            # Delete remote branch if it exists
+            git push origin --delete "$branch_name" 2>/dev/null || true
+          
+            # Create fresh branch from main
+            git checkout -b "$branch_name"
+          fi
 
       - name: Update version in types.go
         run: |
           version="${{ needs.prepare-release.outputs.version }}"
-          sed -i "s/const Version = \".*\"/const Version = \"$version\"/" types.go
+          
+          # Check if types.go exists
+          if [ ! -f types.go ]; then
+            echo "types.go not found, creating it"
+            echo 'package main
+
+          const Version = "'$version'"' > types.go
+          else
+            # Update existing file
+            sed -i "s/const Version = \".*\"/const Version = \"$version\"/" types.go
+          fi
           
           # Verify the change
+          echo "Updated version in types.go:"
           grep "const Version" types.go
 
       - name: Generate changelog
@@ -224,36 +298,51 @@ jobs:
           fi
           
           # Categorize commits
-          echo "### Features" >> CHANGELOG_TEMP.md
+          echo "### 🚀 Features" >> CHANGELOG_TEMP.md
           echo "$commits" | grep -E "^- feat" || echo "- No new features" >> CHANGELOG_TEMP.md
           echo "" >> CHANGELOG_TEMP.md
           
-          echo "### Bug Fixes" >> CHANGELOG_TEMP.md
+          echo "### 🐛 Bug Fixes" >> CHANGELOG_TEMP.md
           echo "$commits" | grep -E "^- fix" || echo "- No bug fixes" >> CHANGELOG_TEMP.md
           echo "" >> CHANGELOG_TEMP.md
           
-          echo "### Other Changes" >> CHANGELOG_TEMP.md
+          echo "### 🔧 Other Changes" >> CHANGELOG_TEMP.md
           echo "$commits" | grep -vE "^- (feat|fix)" || echo "- No other changes" >> CHANGELOG_TEMP.md
           echo "" >> CHANGELOG_TEMP.md
           
           # Add to main CHANGELOG.md if it exists
           if [ -f CHANGELOG.md ]; then
-            # Insert new version at the top
-            echo "# Changelog" > CHANGELOG_NEW.md
-            echo "" >> CHANGELOG_NEW.md
-            cat CHANGELOG_TEMP.md >> CHANGELOG_NEW.md
-            echo "" >> CHANGELOG_NEW.md
-            tail -n +2 CHANGELOG.md >> CHANGELOG_NEW.md
-            mv CHANGELOG_NEW.md CHANGELOG.md
+            # Check if this version already exists in changelog
+            if grep -q "# Changelog for v$version" CHANGELOG.md; then
+              echo "Version already exists in changelog, replacing entry"
+              # Remove existing entry and add new one
+              awk "!/^# Changelog for v$version/,/^# Changelog for v[0-9]/ {if (!/^# Changelog for v[0-9]/ || /^# Changelog for v$version/) next} 1" CHANGELOG.md > CHANGELOG_NEW.md
+              echo "# Changelog" > CHANGELOG_FINAL.md
+              echo "" >> CHANGELOG_FINAL.md
+              cat CHANGELOG_TEMP.md >> CHANGELOG_FINAL.md
+              echo "" >> CHANGELOG_FINAL.md
+              tail -n +2 CHANGELOG_NEW.md >> CHANGELOG_FINAL.md
+              mv CHANGELOG_FINAL.md CHANGELOG.md
+            else
+              # Insert new version at the top
+              echo "# Changelog" > CHANGELOG_NEW.md
+              echo "" >> CHANGELOG_NEW.md
+              cat CHANGELOG_TEMP.md >> CHANGELOG_NEW.md
+              echo "" >> CHANGELOG_NEW.md
+              tail -n +2 CHANGELOG.md >> CHANGELOG_NEW.md
+              mv CHANGELOG_NEW.md CHANGELOG.md
+            fi
           else
             mv CHANGELOG_TEMP.md CHANGELOG.md
           fi
           
           # Store changelog content for PR description
           changelog_content=$(cat CHANGELOG_TEMP.md 2>/dev/null || echo "")
-          echo "changelog_content<<EOF" >> $GITHUB_OUTPUT
-          echo "$changelog_content" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          {
+            echo "changelog_content<<EOF"
+            echo "$changelog_content"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
       - name: Update go.mod if needed
         run: |
@@ -273,12 +362,25 @@ jobs:
           version="${{ needs.prepare-release.outputs.version }}"
           
           git add .
+          
+          # Check if there are changes to commit
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "chore: prepare release v$version"
-            git push origin ${{ env.branch_name }}
+            git commit -m "chore: prepare release v$version
+
+          [skip ci]"
           fi
+
+      - name: Push branch with force
+        run: |
+          version="${{ needs.prepare-release.outputs.version }}"
+          branch_name="${{ env.branch_name }}"
+          
+          # Force push to ensure we overwrite any conflicts
+          git push --force-with-lease origin "$branch_name" || git push --force origin "$branch_name"
+          
+          echo "Successfully pushed $branch_name"
 
       - name: Create or update release PR
         run: |
@@ -308,14 +410,29 @@ jobs:
             gh pr edit $pr_number \
               --title "$pr_title" \
               --body "$pr_body"
+          
+            # Add a comment about the update
+            gh pr comment $pr_number --body "🔄 **Release PR Updated**
+
+          Version updated to v$version with latest changes from main branch.
+
+          Updated: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          
+            echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
           else
             echo "Creating new release PR"
-            gh pr create \
+            pr_url=$(gh pr create \
               --title "$pr_title" \
               --body "$pr_body" \
               --base main \
               --head ${{ env.branch_name }} \
-              --label "release"
+              --label "release")
+          
+            # Extract PR number from URL
+            pr_number=$(echo "$pr_url" | sed 's/.*\/pull\/\([0-9]*\)$/\1/')
+            echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
+          
+            echo "Created new release PR #$pr_number"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -334,14 +451,14 @@ jobs:
         run: |
           # Check if the latest commit is a release commit
           latest_commit_message=$(git log -1 --pretty=format:"%s")
-          if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v//')
+          if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+            version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
             echo "is_release=true" >> $GITHUB_OUTPUT
             echo "version=$version" >> $GITHUB_OUTPUT
             echo "Detected release commit for version $version"
           else
             echo "is_release=false" >> $GITHUB_OUTPUT
-            echo "Not a release commit"
+            echo "Not a release commit: $latest_commit_message"
           fi
 
       - name: Setup Go
@@ -362,9 +479,11 @@ jobs:
           mkdir -p dist
           
           # Build for different architectures
-          GOOS=linux GOARCH=amd64 go build -o dist/frank-go-sdk-linux-amd64 ./...
-          GOOS=darwin GOARCH=amd64 go build -o dist/frank-go-sdk-darwin-amd64 ./...
-          GOOS=windows GOARCH=amd64 go build -o dist/frank-go-sdk-windows-amd64.exe ./...
+          version="${{ steps.check-release.outputs.version }}"
+          GOOS=linux GOARCH=amd64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-linux-amd64 ./...
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-darwin-amd64 ./...
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-darwin-arm64 ./...
+          GOOS=windows GOARCH=amd64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-windows-amd64.exe ./...
 
       - name: Extract changelog for release
         if: steps.check-release.outputs.is_release == 'true'
@@ -378,13 +497,19 @@ jobs:
             awk "/^# Changelog for v$version/,/^# Changelog for v[0-9]/ {if (!/^# Changelog for v[0-9]/ || /^# Changelog for v$version/) print}" CHANGELOG.md > release_notes.md
           
             # Remove the first line (version header) and clean up
-            tail -n +2 release_notes.md > release_notes_cleaned.md
+            if [ -s release_notes.md ]; then
+              tail -n +2 release_notes.md > release_notes_cleaned.md
           
-            # If the file ends with another version header, remove it
-            if tail -n 1 release_notes_cleaned.md | grep -q "^# Changelog for v"; then
-              head -n -1 release_notes_cleaned.md > release_notes_final.md
+              # If the file ends with another version header, remove it
+              if tail -n 1 release_notes_cleaned.md | grep -q "^# Changelog for v"; then
+                head -n -1 release_notes_cleaned.md > release_notes_final.md
+              else
+                mv release_notes_cleaned.md release_notes_final.md
+              fi
             else
-              mv release_notes_cleaned.md release_notes_final.md
+              echo "## Release v$version" > release_notes_final.md
+              echo "" >> release_notes_final.md
+              echo "Automated release with latest changes." >> release_notes_final.md
             fi
           
             echo "Release notes extracted for version $version"
@@ -416,8 +541,9 @@ jobs:
           branch_name="release/v$version"
           
           # Delete the release branch if it exists
-          if git show-ref --verify --quiet refs/remotes/origin/$branch_name; then
-            git push origin --delete $branch_name || echo "Branch already deleted"
+          if git ls-remote --heads origin "$branch_name" | grep -q "$branch_name"; then
+            git push origin --delete "$branch_name" || echo "Branch already deleted or couldn't delete"
+            echo "Deleted release branch: $branch_name"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
