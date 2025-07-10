@@ -53,19 +53,75 @@ jobs:
           latest_commit_message=$(git log -1 --pretty=format:"%s")
           echo "Latest commit: $latest_commit_message"
 
-          # Check if this is a release preparation commit
+          # Method 1: Check if this is a direct release preparation commit
           if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             echo "is_release_commit=true" >> $GITHUB_OUTPUT
             version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
             echo "release_version=$version" >> $GITHUB_OUTPUT
             echo "This is a release commit for version $version"
-
-            # Exit early - don't need to check other things for release commits
             exit 0
-          else
-            echo "is_release_commit=false" >> $GITHUB_OUTPUT
-            echo "This is not a release commit"
           fi
+
+          # Method 2: Check if this is a merge commit from a release branch
+          if [[ "$latest_commit_message" =~ ^Merge\ pull\ request\ #[0-9]+\ from\ .*/release/v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Detected merge from release branch"
+            # Extract version from branch name
+            version=$(echo "$latest_commit_message" | sed -n 's/.*release\/v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')
+            if [ -n "$version" ]; then
+              echo "is_release_commit=true" >> $GITHUB_OUTPUT
+              echo "release_version=$version" >> $GITHUB_OUTPUT
+              echo "This is a release merge commit for version $version"
+              exit 0
+            fi
+          fi
+
+          # Method 3: Check if this is a merge commit where the PR was a release PR
+          if [[ "$latest_commit_message" =~ ^Merge\ pull\ request\ #([0-9]+) ]]; then
+            pr_number=$(echo "$latest_commit_message" | sed -n 's/.*#\([0-9]*\).*/\1/p')
+            echo "Checking if PR #$pr_number was a release PR..."
+          
+            # Check if the PR had release label or title pattern
+            if command -v gh >/dev/null 2>&1; then
+              pr_info=$(gh pr view $pr_number --json labels,title,headRefName 2>/dev/null || echo "")
+              if [ -n "$pr_info" ]; then
+                pr_title=$(echo "$pr_info" | jq -r '.title // ""')
+                pr_labels=$(echo "$pr_info" | jq -r '.labels[]?.name // ""')
+                pr_branch=$(echo "$pr_info" | jq -r '.headRefName // ""')
+          
+                echo "PR title: $pr_title"
+                echo "PR labels: $pr_labels"
+                echo "PR branch: $pr_branch"
+          
+                # Check if PR was a release PR
+                if [[ "$pr_title" =~ ^Release\ v[0-9]+\.[0-9]+\.[0-9]+$ ]] || echo "$pr_labels" | grep -q "release"; then
+                  version=$(echo "$pr_title" | sed -n 's/^Release v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p')
+                  if [ -n "$version" ]; then
+                    echo "is_release_commit=true" >> $GITHUB_OUTPUT
+                    echo "release_version=$version" >> $GITHUB_OUTPUT
+                    echo "This is a release merge commit for version $version (detected via PR)"
+                    exit 0
+                  fi
+                fi
+              fi
+            fi
+          fi
+
+          # Method 4: Check recent commits for release preparation
+          # Look at the last 3 commits to see if any were release preparation commits
+          recent_commits=$(git log -3 --pretty=format:"%s" --no-merges)
+          release_commit=$(echo "$recent_commits" | grep -E "^chore: prepare release v[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+          
+          if [ -n "$release_commit" ]; then
+            version=$(echo "$release_commit" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
+            echo "is_release_commit=true" >> $GITHUB_OUTPUT
+            echo "release_version=$version" >> $GITHUB_OUTPUT
+            echo "This is a release commit for version $version (found in recent commits)"
+            exit 0
+          fi
+
+          # Default: Not a release commit
+          echo "is_release_commit=false" >> $GITHUB_OUTPUT
+          echo "This is not a release commit"
 
       # Only run the following steps if this is NOT a release commit
       - name: Setup Go
@@ -212,6 +268,7 @@ jobs:
           echo "version=$new_version" >> $GITHUB_OUTPUT
           echo "release_type=$release_type" >> $GITHUB_OUTPUT
           echo "New version: $new_version (type: $release_type)"
+
   create-or-update-release-pr:
     needs: prepare-release
     if: |
