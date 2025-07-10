@@ -28,7 +28,6 @@ permissions:
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
-    # Skip if commit message contains [skip release] or [release skip]
     if: |
       !contains(github.event.head_commit.message, '[skip release]') &&
       !contains(github.event.head_commit.message, '[release skip]') &&
@@ -51,32 +50,48 @@ jobs:
       - name: Check if this is a release commit
         id: check-release-commit
         run: |
+          # Get the commit message - be very explicit about this
           latest_commit_message=$(git log -1 --pretty=format:"%s")
-          echo "Latest commit: $latest_commit_message"
+          echo "=== COMMIT MESSAGE DEBUG ==="
+          echo "Raw commit message: '$latest_commit_message'"
+          echo "Message length: ${#latest_commit_message}"
+          echo "=========================="
           
-          # Check if this is a release preparation commit
-          if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          # More robust pattern matching
+          if echo "$latest_commit_message" | grep -E "^chore: prepare release v[0-9]+\.[0-9]+\.[0-9]+"; then
+            echo "✅ DETECTED: This is a release commit"
             echo "is_release_commit=true" >> $GITHUB_OUTPUT
-            version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
-            echo "release_version=$version" >> $GITHUB_OUTPUT
-            echo "This is a release commit for version $version"
           
-            # Exit early if this is a release commit - no need to check other things
-            exit 0
+            # Extract version more carefully
+            version=$(echo "$latest_commit_message" | sed -n 's/^chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')
+            echo "release_version=$version" >> $GITHUB_OUTPUT
+            echo "Extracted version: $version"
+          
+            # Set should_release to false to prevent PR creation
+            echo "This is a release commit - setting should_release=false"
+          
           else
+            echo "❌ NOT DETECTED: This is not a release commit"
             echo "is_release_commit=false" >> $GITHUB_OUTPUT
-            echo "This is not a release commit"
+            echo "Will check if we need to create a release PR"
           fi
+          
+          # Debug: Show what we're outputting
+          echo "=== OUTPUTS ==="
+          echo "is_release_commit: $(cat $GITHUB_OUTPUT | grep is_release_commit || echo 'not set')"
+          echo "release_version: $(cat $GITHUB_OUTPUT | grep release_version || echo 'not set')"
+          echo "==============="
 
+      # Only run the following steps if this is NOT a release commit
       - name: Setup Go
-        if: steps.check-release-commit.outputs.is_release_commit == 'false'
+        if: steps.check-release-commit.outputs.is_release_commit != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
       - name: Get latest release
         id: latest-release
-        if: steps.check-release-commit.outputs.is_release_commit == 'false'
+        if: steps.check-release-commit.outputs.is_release_commit != 'true'
         run: |
           latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
@@ -84,7 +99,7 @@ jobs:
 
       - name: Check for changes since last release
         id: check-changes
-        if: steps.check-release-commit.outputs.is_release_commit == 'false'
+        if: steps.check-release-commit.outputs.is_release_commit != 'true'
         run: |
           latest_tag="${{ steps.latest-release.outputs.latest_tag }}"
           
@@ -119,7 +134,7 @@ jobs:
 
       - name: Find existing release PR
         id: find-pr
-        if: steps.check-release-commit.outputs.is_release_commit == 'false'
+        if: steps.check-release-commit.outputs.is_release_commit != 'true'
         run: |
           # Look for open PRs with release label
           pr_data=$(gh pr list --state open --label "release" --json number,title,headRefName --limit 1)
@@ -147,7 +162,7 @@ jobs:
       - name: Determine next version
         id: version
         if: |
-          steps.check-release-commit.outputs.is_release_commit == 'false' &&
+          steps.check-release-commit.outputs.is_release_commit != 'true' &&
           steps.check-changes.outputs.should_release == 'true'
         run: |
           latest_tag="${{ steps.latest-release.outputs.latest_tag }}"
@@ -156,38 +171,17 @@ jobs:
           # Remove 'v' prefix if present
           current_version=${latest_tag#v}
           
-          # If no previous version, start with 1.0.0
+          # If no previous version, start with 0.0.1
           if [ "$current_version" = "0.0.0" ]; then
-            current_version="1.0.0"
+            current_version="0.0.0"
           fi
           
           # If there's an existing release PR, use that version unless we need a higher one
           if [ -n "$existing_version" ]; then
             echo "Found existing release PR for version $existing_version"
-          
-            # Check if we need to bump the version higher based on new commits
-            latest_pr_commit=$(gh pr view ${{ steps.find-pr.outputs.pr_number }} --json commits --jq '.commits[-1].oid' || echo "")
-          
-            if [ -n "$latest_pr_commit" ]; then
-              # Check for commits since the PR was last updated
-              new_commits=$(git rev-list --count ${latest_pr_commit}..HEAD || echo "0")
-          
-              if [ "$new_commits" -gt 0 ]; then
-                echo "Found $new_commits new commits since last PR update"
-                # Use the existing version as base and potentially bump it
-                current_version="$existing_version"
-              else
-                echo "No new commits since last PR update, using existing version"
-                echo "version=$existing_version" >> $GITHUB_OUTPUT
-                echo "release_type=existing" >> $GITHUB_OUTPUT
-                exit 0
-              fi
-            else
-              echo "Using existing version from PR: $existing_version"
-              echo "version=$existing_version" >> $GITHUB_OUTPUT
-              echo "release_type=existing" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+            echo "version=$existing_version" >> $GITHUB_OUTPUT
+            echo "release_type=existing" >> $GITHUB_OUTPUT
+            exit 0
           fi
           
           # Split version into parts
@@ -233,7 +227,6 @@ jobs:
           echo "version=$new_version" >> $GITHUB_OUTPUT
           echo "release_type=$release_type" >> $GITHUB_OUTPUT
           echo "New version: $new_version (type: $release_type)"
-
   create-or-update-release-pr:
     needs: prepare-release
     if: |
