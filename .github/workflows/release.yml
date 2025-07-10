@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     branches: [main]
+    # Exclude pushes that are just tags to prevent loops
+    tags-ignore: ['**']
   schedule:
     # Run daily at 9 AM UTC to check for unreleased changes
     - cron: '0 9 * * *'
@@ -26,12 +28,19 @@ permissions:
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
+    # Skip if commit message contains [skip release] or [release skip]
+    if: |
+      !contains(github.event.head_commit.message, '[skip release]') &&
+      !contains(github.event.head_commit.message, '[release skip]') &&
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !startsWith(github.event.head_commit.message, 'chore: prepare release')
     outputs:
       should_release: ${{ steps.check-changes.outputs.should_release }}
       version: ${{ steps.version.outputs.version }}
       pr_number: ${{ steps.find-pr.outputs.pr_number }}
       pr_exists: ${{ steps.find-pr.outputs.pr_exists }}
       existing_version: ${{ steps.find-pr.outputs.existing_version }}
+      is_release_commit: ${{ steps.check-release-commit.outputs.is_release_commit }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,13 +48,32 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check if this is a release commit
+        id: check-release-commit
+        run: |
+          latest_commit_message=$(git log -1 --pretty=format:"%s")
+          echo "Latest commit: $latest_commit_message"
+          
+          # Check if this is a release preparation commit
+          if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "is_release_commit=true" >> $GITHUB_OUTPUT
+            version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
+            echo "release_version=$version" >> $GITHUB_OUTPUT
+            echo "This is a release commit for version $version"
+          else
+            echo "is_release_commit=false" >> $GITHUB_OUTPUT
+            echo "This is not a release commit"
+          fi
+
       - name: Setup Go
+        if: steps.check-release-commit.outputs.is_release_commit == 'false'
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
       - name: Get latest release
         id: latest-release
+        if: steps.check-release-commit.outputs.is_release_commit == 'false'
         run: |
           latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
@@ -53,6 +81,7 @@ jobs:
 
       - name: Check for changes since last release
         id: check-changes
+        if: steps.check-release-commit.outputs.is_release_commit == 'false'
         run: |
           latest_tag="${{ steps.latest-release.outputs.latest_tag }}"
           
@@ -87,6 +116,7 @@ jobs:
 
       - name: Find existing release PR
         id: find-pr
+        if: steps.check-release-commit.outputs.is_release_commit == 'false'
         run: |
           # Look for open PRs with release label
           pr_data=$(gh pr list --state open --label "release" --json number,title,headRefName --limit 1)
@@ -113,7 +143,9 @@ jobs:
 
       - name: Determine next version
         id: version
-        if: steps.check-changes.outputs.should_release == 'true'
+        if: |
+          steps.check-release-commit.outputs.is_release_commit == 'false' &&
+          steps.check-changes.outputs.should_release == 'true'
         run: |
           latest_tag="${{ steps.latest-release.outputs.latest_tag }}"
           existing_version="${{ steps.find-pr.outputs.existing_version }}"
@@ -201,7 +233,9 @@ jobs:
 
   create-or-update-release-pr:
     needs: prepare-release
-    if: needs.prepare-release.outputs.should_release == 'true'
+    if: |
+      needs.prepare-release.outputs.should_release == 'true' &&
+      needs.prepare-release.outputs.is_release_commit == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -367,9 +401,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "chore: prepare release v$version
-
-          [skip ci]"
+            git commit -m "chore: prepare release v$version [skip release]"
           fi
 
       - name: Push branch with force
@@ -439,57 +471,70 @@ jobs:
 
   create-release:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: |
+      github.event_name == 'push' && 
+      github.ref == 'refs/heads/main' &&
+      needs.prepare-release.outputs.is_release_commit == 'true'
+    needs: prepare-release
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check if this is a release merge
-        id: check-release
+      - name: Get release version
+        id: get-version
         run: |
-          # Check if the latest commit is a release commit
-          latest_commit_message=$(git log -1 --pretty=format:"%s")
-          if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
-            version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
-            echo "is_release=true" >> $GITHUB_OUTPUT
-            echo "version=$version" >> $GITHUB_OUTPUT
-            echo "Detected release commit for version $version"
+          version="${{ needs.prepare-release.outputs.release_version }}"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Release version: $version"
+
+      - name: Check if tag already exists
+        id: check-tag
+        run: |
+          version="${{ steps.get-version.outputs.version }}"
+          
+          if git tag -l "v$version" | grep -q "v$version"; then
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "Tag v$version already exists"
           else
-            echo "is_release=false" >> $GITHUB_OUTPUT
-            echo "Not a release commit: $latest_commit_message"
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            echo "Tag v$version does not exist"
           fi
 
       - name: Setup Go
-        if: steps.check-release.outputs.is_release == 'true'
+        if: steps.check-tag.outputs.tag_exists == 'false'
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
       - name: Run tests
-        if: steps.check-release.outputs.is_release == 'true'
+        if: steps.check-tag.outputs.tag_exists == 'false'
         run: |
           go mod download
           go test ./...
 
       - name: Build binaries
-        if: steps.check-release.outputs.is_release == 'true'
+        if: steps.check-tag.outputs.tag_exists == 'false'
         run: |
           mkdir -p dist
           
           # Build for different architectures
-          version="${{ steps.check-release.outputs.version }}"
+          version="${{ steps.get-version.outputs.version }}"
           GOOS=linux GOARCH=amd64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-linux-amd64 ./...
           GOOS=darwin GOARCH=amd64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-darwin-amd64 ./...
           GOOS=darwin GOARCH=arm64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-darwin-arm64 ./...
           GOOS=windows GOARCH=amd64 go build -ldflags="-X main.version=$version" -o dist/frank-go-sdk-windows-amd64.exe ./...
+          
+          echo "Built binaries:"
+          ls -la dist/
 
       - name: Extract changelog for release
-        if: steps.check-release.outputs.is_release == 'true'
+        if: steps.check-tag.outputs.tag_exists == 'false'
         id: changelog
         run: |
-          version="${{ steps.check-release.outputs.version }}"
+          version="${{ steps.get-version.outputs.version }}"
           
           # Extract changelog for this version
           if [ -f CHANGELOG.md ]; then
@@ -519,31 +564,87 @@ jobs:
             echo "" >> release_notes_final.md
             echo "Automated release with latest changes." >> release_notes_final.md
           fi
+          
+          echo "Release notes content:"
+          cat release_notes_final.md
+
+      - name: Configure Git for tagging
+        if: steps.check-tag.outputs.tag_exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create Git Tag
+        if: steps.check-tag.outputs.tag_exists == 'false'
+        run: |
+          version="${{ steps.get-version.outputs.version }}"
+          
+          # Create annotated tag
+          git tag -a "v$version" -m "Release v$version
+
+          $(cat release_notes_final.md)"
+          
+          # Push the tag
+          git push origin "v$version"
+          
+          echo "Created and pushed tag v$version"
+
+      - name: Verify tag was created
+        if: steps.check-tag.outputs.tag_exists == 'false'
+        run: |
+          version="${{ steps.get-version.outputs.version }}"
+          
+          # Fetch to make sure we have the latest tags
+          git fetch --tags
+          
+          # Verify the tag exists
+          if git tag -l "v$version" | grep -q "v$version"; then
+            echo "✅ Tag v$version was successfully created"
+            git show "v$version" --no-patch --format="Tag: %D%nDate: %ad%nMessage: %B"
+          else
+            echo "❌ Failed to create tag v$version"
+            exit 1
+          fi
 
       - name: Create GitHub Release
-        if: steps.check-release.outputs.is_release == 'true'
+        if: steps.check-tag.outputs.tag_exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.check-release.outputs.version }}
-          name: Release v${{ steps.check-release.outputs.version }}
+          tag_name: v${{ steps.get-version.outputs.version }}
+          name: Release v${{ steps.get-version.outputs.version }}
           body_path: release_notes_final.md
           files: |
             dist/*
           draft: false
           prerelease: false
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Clean up release branch
-        if: steps.check-release.outputs.is_release == 'true'
+        if: steps.check-tag.outputs.tag_exists == 'false'
         run: |
-          version="${{ steps.check-release.outputs.version }}"
+          version="${{ steps.get-version.outputs.version }}"
           branch_name="release/v$version"
           
           # Delete the release branch if it exists
           if git ls-remote --heads origin "$branch_name" | grep -q "$branch_name"; then
             git push origin --delete "$branch_name" || echo "Branch already deleted or couldn't delete"
             echo "Deleted release branch: $branch_name"
+          fi
+
+      - name: Verify release was created
+        if: steps.check-tag.outputs.tag_exists == 'false'
+        run: |
+          version="${{ steps.get-version.outputs.version }}"
+          
+          # Check if GitHub release was created
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "✅ GitHub release v$version was successfully created"
+            gh release view "v$version"
+          else
+            echo "❌ GitHub release v$version was not created"
+            exit 1
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
