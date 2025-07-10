@@ -60,7 +60,6 @@ else
     echo "Current commit is not a release commit"
 fi
 
-
 # Check for any open release PRs that might be stuck
 if command -v gh >/dev/null 2>&1; then
     echo ""
