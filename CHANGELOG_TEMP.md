@@ -1,5 +1,3 @@
-# Changelog
-
 # Changelog for v0.0.3
 
 ## What's Changed
@@ -9,5 +7,4 @@
 ### 🐛 Bug Fixes
 
 ### 🔧 Other Changes
-
 
