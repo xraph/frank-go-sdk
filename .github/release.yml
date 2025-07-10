@@ -1,0 +1,148 @@
+# Configuration for automated releases
+
+# Release rules - determines version bump based on commit messages
+release_rules:
+  - type: feat
+    release: minor
+  - type: fix
+    release: patch
+  - type: perf
+    release: patch
+  - type: refactor
+    release: patch
+  - type: docs
+    release: false
+  - type: ci
+    release: false
+  - type: test
+    release: false
+  - type: chore
+    release: false
+  - scope: breaking
+    release: major
+  - breaking: true
+    release: major
+
+# Changelog configuration
+changelog:
+  # Categories for grouping changes
+  categories:
+    - title: "🚀 Features"
+      labels: ["feature", "feat"]
+    - title: "🐛 Bug Fixes"
+      labels: ["bugfix", "fix"]
+    - title: "🚨 Breaking Changes"
+      labels: ["breaking-change", "breaking"]
+    - title: "⚡ Performance"
+      labels: ["performance", "perf"]
+    - title: "🔧 Maintenance"
+      labels: ["maintenance", "refactor", "chore"]
+    - title: "📚 Documentation"
+      labels: ["documentation", "docs"]
+    - title: "🧪 Testing"
+      labels: ["testing", "test"]
+
+  # Commit types to include in changelog
+  commit_types:
+    - feat
+    - fix
+    - perf
+    - refactor
+    - docs
+    - test
+    - ci
+    - chore
+    - breaking
+
+# Files to update during release
+files_to_update:
+  - file: "types.go"
+    pattern: 'const Version = ".*"'
+    replacement: 'const Version = "${version}"'
+  - file: "go.mod"
+    pattern: '// v.*'
+    replacement: '// v${version}'
+
+# Release notes configuration
+release_notes:
+  # Include commit authors
+  include_authors: true
+  # Include commit links
+  include_links: true
+  # Template for release notes
+  template: |
+    ## What's Changed
+    
+    ${changelog}
+    
+    ## Contributors
+    
+    ${contributors}
+    
+    **Full Changelog**: https://github.com/${owner}/${repo}/compare/${previous_tag}...${tag}
+
+# Build configuration
+build:
+  # Platforms to build for
+  platforms:
+    - linux/amd64
+    - darwin/amd64
+    - darwin/arm64
+    - windows/amd64
+
+  # Build command
+  command: "go build -ldflags='-X main.version=${version}' -o dist/"
+
+  # Files to include in release
+  assets:
+    - "dist/*"
+    - "README.md"
+    - "LICENSE"
+    - "CHANGELOG.md"
+
+# PR configuration
+pull_request:
+  # Title template
+  title_template: "Release v${version}"
+
+  # Body template
+  body_template: |
+    ## Release v${version}
+    
+    This is an automated release PR.
+    
+    ### Changes
+    
+    ${changelog}
+    
+    ### Release Checklist
+    
+    - [x] Version updated in source files
+    - [x] Changelog generated
+    - [x] Tests passing
+    - [ ] Ready to merge and release
+    
+    Once this PR is merged, a new release will be automatically created.
+
+  # Labels to add to release PR
+  labels:
+    - "release"
+    - "automated"
+
+  # Reviewers to request (optional)
+  reviewers: []
+
+  # Team reviewers to request (optional)
+  team_reviewers: []
+
+# Notification settings
+notifications:
+  # Notify on release creation
+  on_release: true
+  # Notify on release failure
+  on_failure: true
+  # Channels to notify (if using external services)
+  channels:
+    slack: false
+    discord: false
+    email: false

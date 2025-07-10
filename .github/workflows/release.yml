@@ -1,0 +1,423 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Run daily at 9 AM UTC to check for unreleased changes
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type (patch, minor, major)'
+        required: false
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check-changes.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      pr_number: ${{ steps.find-pr.outputs.pr_number }}
+      pr_exists: ${{ steps.find-pr.outputs.pr_exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Get latest release
+        id: latest-release
+        run: |
+          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
+          echo "Latest tag: $latest_tag"
+
+      - name: Check for changes since last release
+        id: check-changes
+        run: |
+          latest_tag="${{ steps.latest-release.outputs.latest_tag }}"
+          
+          # Check if there are any commits since the last release
+          if [ "$latest_tag" = "v0.0.0" ]; then
+            commits_since_release=$(git rev-list --count HEAD)
+          else
+            commits_since_release=$(git rev-list --count ${latest_tag}..HEAD)
+          fi
+          
+          echo "commits_since_release=$commits_since_release"
+          
+          # Check if there are any significant changes (not just CI/docs)
+          if [ "$commits_since_release" -gt 0 ]; then
+            if [ "$latest_tag" = "v0.0.0" ]; then
+              significant_changes=$(git log --oneline --grep="^feat\|^fix\|^refactor\|^perf\|BREAKING" --grep="^feat\|^fix\|^refactor\|^perf\|BREAKING" HEAD || echo "")
+            else
+              significant_changes=$(git log --oneline --grep="^feat\|^fix\|^refactor\|^perf\|BREAKING" ${latest_tag}..HEAD || echo "")
+            fi
+          
+            if [ -n "$significant_changes" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "should_release=true" >> $GITHUB_OUTPUT
+              echo "Should release: true"
+            else
+              echo "should_release=false" >> $GITHUB_OUTPUT
+              echo "Should release: false (no significant changes)"
+            fi
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "Should release: false (no commits since last release)"
+          fi
+
+      - name: Find existing release PR
+        id: find-pr
+        run: |
+          pr_number=$(gh pr list --state open --label "release" --json number --jq '.[0].number // empty')
+          if [ -n "$pr_number" ]; then
+            echo "pr_exists=true" >> $GITHUB_OUTPUT
+            echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
+            echo "Found existing release PR: #$pr_number"
+          else
+            echo "pr_exists=false" >> $GITHUB_OUTPUT
+            echo "No existing release PR found"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine next version
+        id: version
+        if: steps.check-changes.outputs.should_release == 'true'
+        run: |
+          latest_tag="${{ steps.latest-release.outputs.latest_tag }}"
+          
+          # Remove 'v' prefix if present
+          current_version=${latest_tag#v}
+          
+          # If no previous version, start with 1.0.0
+          if [ "$current_version" = "0.0.0" ]; then
+            current_version="1.0.0"
+          fi
+          
+          # Split version into parts
+          IFS='.' read -r major minor patch <<< "$current_version"
+          
+          # Determine version bump type
+          release_type="${{ github.event.inputs.release_type }}"
+          
+          # Auto-detect release type based on commit messages if not specified
+          if [ -z "$release_type" ] || [ "$release_type" = "patch" ]; then
+            if [ "$latest_tag" = "v0.0.0" ]; then
+              commits_to_check=$(git log --oneline HEAD)
+            else
+              commits_to_check=$(git log --oneline ${latest_tag}..HEAD)
+            fi
+          
+            if echo "$commits_to_check" | grep -q "BREAKING\|^feat!"; then
+              release_type="major"
+            elif echo "$commits_to_check" | grep -q "^feat"; then
+              release_type="minor"
+            else
+              release_type="patch"
+            fi
+          fi
+          
+          # Increment version
+          case $release_type in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+          esac
+          
+          new_version="$major.$minor.$patch"
+          echo "version=$new_version" >> $GITHUB_OUTPUT
+          echo "release_type=$release_type" >> $GITHUB_OUTPUT
+          echo "New version: $new_version (type: $release_type)"
+
+  create-or-update-release-pr:
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create or update release branch
+        run: |
+          version="${{ needs.prepare-release.outputs.version }}"
+          branch_name="release/v$version"
+          
+          # Check if branch exists
+          if git show-ref --verify --quiet refs/heads/$branch_name; then
+            echo "Branch $branch_name already exists, checking out and updating"
+            git checkout $branch_name
+            git rebase main
+          else
+            echo "Creating new branch $branch_name"
+            git checkout -b $branch_name
+          fi
+          
+          echo "branch_name=$branch_name" >> $GITHUB_ENV
+
+      - name: Update version in types.go
+        run: |
+          version="${{ needs.prepare-release.outputs.version }}"
+          sed -i "s/const Version = \".*\"/const Version = \"$version\"/" types.go
+          
+          # Verify the change
+          grep "const Version" types.go
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          version="${{ needs.prepare-release.outputs.version }}"
+          
+          # Get the latest tag for changelog generation
+          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          echo "# Changelog for v$version" > CHANGELOG_TEMP.md
+          echo "" >> CHANGELOG_TEMP.md
+          echo "## What's Changed" >> CHANGELOG_TEMP.md
+          echo "" >> CHANGELOG_TEMP.md
+          
+          # Generate changelog from commits
+          if [ -n "$latest_tag" ]; then
+            commits=$(git log --oneline --pretty=format:"- %s" ${latest_tag}..HEAD)
+          else
+            commits=$(git log --oneline --pretty=format:"- %s" HEAD)
+          fi
+          
+          # Categorize commits
+          echo "### Features" >> CHANGELOG_TEMP.md
+          echo "$commits" | grep -E "^- feat" || echo "- No new features" >> CHANGELOG_TEMP.md
+          echo "" >> CHANGELOG_TEMP.md
+          
+          echo "### Bug Fixes" >> CHANGELOG_TEMP.md
+          echo "$commits" | grep -E "^- fix" || echo "- No bug fixes" >> CHANGELOG_TEMP.md
+          echo "" >> CHANGELOG_TEMP.md
+          
+          echo "### Other Changes" >> CHANGELOG_TEMP.md
+          echo "$commits" | grep -vE "^- (feat|fix)" || echo "- No other changes" >> CHANGELOG_TEMP.md
+          echo "" >> CHANGELOG_TEMP.md
+          
+          # Add to main CHANGELOG.md if it exists
+          if [ -f CHANGELOG.md ]; then
+            # Insert new version at the top
+            echo "# Changelog" > CHANGELOG_NEW.md
+            echo "" >> CHANGELOG_NEW.md
+            cat CHANGELOG_TEMP.md >> CHANGELOG_NEW.md
+            echo "" >> CHANGELOG_NEW.md
+            tail -n +2 CHANGELOG.md >> CHANGELOG_NEW.md
+            mv CHANGELOG_NEW.md CHANGELOG.md
+          else
+            mv CHANGELOG_TEMP.md CHANGELOG.md
+          fi
+          
+          # Store changelog content for PR description
+          changelog_content=$(cat CHANGELOG_TEMP.md 2>/dev/null || echo "")
+          echo "changelog_content<<EOF" >> $GITHUB_OUTPUT
+          echo "$changelog_content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update go.mod if needed
+        run: |
+          # Update module version in go.mod if it contains version info
+          if grep -q "// v" go.mod; then
+            version="${{ needs.prepare-release.outputs.version }}"
+            sed -i "s|// v.*|// v$version|" go.mod
+          fi
+
+      - name: Run tests
+        run: |
+          go mod download
+          go test ./...
+
+      - name: Commit changes
+        run: |
+          version="${{ needs.prepare-release.outputs.version }}"
+          
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: prepare release v$version"
+            git push origin ${{ env.branch_name }}
+          fi
+
+      - name: Create or update release PR
+        run: |
+          version="${{ needs.prepare-release.outputs.version }}"
+          pr_exists="${{ needs.prepare-release.outputs.pr_exists }}"
+          pr_number="${{ needs.prepare-release.outputs.pr_number }}"
+          
+          pr_title="Release v$version"
+          pr_body="## Release v$version
+
+          This is an automated release PR.
+
+          ${{ steps.changelog.outputs.changelog_content }}
+
+          ---
+
+          **Release Checklist:**
+          - [x] Version updated in types.go
+          - [x] Changelog generated
+          - [x] Tests passing
+          - [ ] Ready to merge and release
+
+          Once this PR is merged, a new release will be automatically created."
+          
+          if [ "$pr_exists" = "true" ]; then
+            echo "Updating existing release PR #$pr_number"
+            gh pr edit $pr_number \
+              --title "$pr_title" \
+              --body "$pr_body"
+          else
+            echo "Creating new release PR"
+            gh pr create \
+              --title "$pr_title" \
+              --body "$pr_body" \
+              --base main \
+              --head ${{ env.branch_name }} \
+              --label "release"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  create-release:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if this is a release merge
+        id: check-release
+        run: |
+          # Check if the latest commit is a release commit
+          latest_commit_message=$(git log -1 --pretty=format:"%s")
+          if [[ "$latest_commit_message" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            version=$(echo "$latest_commit_message" | sed 's/chore: prepare release v//')
+            echo "is_release=true" >> $GITHUB_OUTPUT
+            echo "version=$version" >> $GITHUB_OUTPUT
+            echo "Detected release commit for version $version"
+          else
+            echo "is_release=false" >> $GITHUB_OUTPUT
+            echo "Not a release commit"
+          fi
+
+      - name: Setup Go
+        if: steps.check-release.outputs.is_release == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Run tests
+        if: steps.check-release.outputs.is_release == 'true'
+        run: |
+          go mod download
+          go test ./...
+
+      - name: Build binaries
+        if: steps.check-release.outputs.is_release == 'true'
+        run: |
+          mkdir -p dist
+          
+          # Build for different architectures
+          GOOS=linux GOARCH=amd64 go build -o dist/frank-go-sdk-linux-amd64 ./...
+          GOOS=darwin GOARCH=amd64 go build -o dist/frank-go-sdk-darwin-amd64 ./...
+          GOOS=windows GOARCH=amd64 go build -o dist/frank-go-sdk-windows-amd64.exe ./...
+
+      - name: Extract changelog for release
+        if: steps.check-release.outputs.is_release == 'true'
+        id: changelog
+        run: |
+          version="${{ steps.check-release.outputs.version }}"
+          
+          # Extract changelog for this version
+          if [ -f CHANGELOG.md ]; then
+            # Find the section for this version
+            awk "/^# Changelog for v$version/,/^# Changelog for v[0-9]/ {if (!/^# Changelog for v[0-9]/ || /^# Changelog for v$version/) print}" CHANGELOG.md > release_notes.md
+          
+            # Remove the first line (version header) and clean up
+            tail -n +2 release_notes.md > release_notes_cleaned.md
+          
+            # If the file ends with another version header, remove it
+            if tail -n 1 release_notes_cleaned.md | grep -q "^# Changelog for v"; then
+              head -n -1 release_notes_cleaned.md > release_notes_final.md
+            else
+              mv release_notes_cleaned.md release_notes_final.md
+            fi
+          
+            echo "Release notes extracted for version $version"
+          else
+            echo "No changelog found, creating basic release notes"
+            echo "## Release v$version" > release_notes_final.md
+            echo "" >> release_notes_final.md
+            echo "Automated release with latest changes." >> release_notes_final.md
+          fi
+
+      - name: Create GitHub Release
+        if: steps.check-release.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.check-release.outputs.version }}
+          name: Release v${{ steps.check-release.outputs.version }}
+          body_path: release_notes_final.md
+          files: |
+            dist/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean up release branch
+        if: steps.check-release.outputs.is_release == 'true'
+        run: |
+          version="${{ steps.check-release.outputs.version }}"
+          branch_name="release/v$version"
+          
+          # Delete the release branch if it exists
+          if git show-ref --verify --quiet refs/remotes/origin/$branch_name; then
+            git push origin --delete $branch_name || echo "Branch already deleted"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
