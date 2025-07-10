@@ -331,7 +331,7 @@ func (m *Middleware) authenticateAPIKey(ctx context.Context, r *http.Request) (*
 func (m *Middleware) authenticateSession(ctx context.Context, r *http.Request) (*Session, *User, error) {
 	// Try session token from cookie first
 	sessionToken := ""
-	if cookie, err := r.Cookie("frank_session"); err == nil {
+	if cookie, err := r.Cookie(m.client.GetConfig().SessionCookieName); err == nil {
 		sessionToken = cookie.Value
 	}
 

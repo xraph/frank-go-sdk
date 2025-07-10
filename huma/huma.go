@@ -78,8 +78,6 @@ func (m *HumaMiddleware) RequireAuth() func(huma.Context, func(huma.Context)) {
 		// Add request metadata
 		ctx = m.addRequestMetadata(ctx, r)
 
-		fmt.Println("session token: logged in finally")
-
 		next(ctx)
 	}
 }
