@@ -1,5 +1,4 @@
 # Frank Auth Go SDK
-
 A comprehensive Go SDK for integrating with Frank Auth - a multi-tenant authentication SaaS platform. This SDK provides middleware for both standard HTTP handlers and the Huma framework, supporting JWT, API keys, session-based authentication, and comprehensive RBAC.
 
 ## Features
