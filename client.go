@@ -715,13 +715,21 @@ func (c *Client) VerifyJWT(ctx context.Context, token string) (*User, error) {
 		Type:  "jwt",
 	}
 
-	var resp VerifyTokenResponse
-	if err := c.doRequest(ctx, "POST", "/api/v1/auth/verify", req, &resp); err != nil {
+	// var resp VerifyTokenResponse
+	// if err := c.doRequest(ctx, "POST", "/api/v1/auth/verify", req, &resp); err != nil {
+	// 	c.debugLog("VerifyJWT failed: %v", err)
+	// 	return nil, err
+	// }
+
+	var resp VerifySessionResponse
+	if err := c.doRequestWithHeadersAndCookies(ctx, "GET", "/api/v1/me/auth/status", req, &resp, map[string]string{
+		"Authorization": "Bearer " + token,
+	}, nil); err != nil {
 		c.debugLog("VerifyJWT failed: %v", err)
 		return nil, err
 	}
 
-	if !resp.Valid {
+	if !resp.IsAuthenticated {
 		c.debugLog("VerifyJWT: token is invalid")
 		return nil, &Error{
 			Code:    "INVALID_TOKEN",
@@ -743,8 +751,10 @@ func (c *Client) VerifyAPIKey(ctx context.Context, apiKey string) (*APIKey, *Use
 	}
 
 	var resp VerifyAPIKeyResponse
-	if err := c.doRequest(ctx, "POST", "/api/v1/auth/verify", req, &resp); err != nil {
-		c.debugLog("VerifyAPIKey failed: %v", err)
+	if err := c.doRequestWithHeadersAndCookies(ctx, "GET", "/api/v1/me/auth/status", req, &resp, map[string]string{
+		"X-API-Key": apiKey,
+	}, nil); err != nil {
+		c.debugLog("VerifyJWT failed: %v", err)
 		return nil, nil, err
 	}
 

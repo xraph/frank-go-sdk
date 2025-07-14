@@ -1,89 +1,137 @@
 #!/bin/bash
 
-# Quick fix for the current release issue
+# Quick fix for release detection issue
+# This script will help diagnose and fix the immediate problem
+
 set -e
 
-echo "🔧 Fixing current release state..."
+echo "🔍 Diagnosing Release Detection Issue"
+echo "====================================="
 
-# Check if we have a release commit that needs to be processed
+# Check the current commit message
 latest_commit=$(git log -1 --pretty=format:"%s")
-echo "Latest commit: $latest_commit"
+echo "Latest commit message: '$latest_commit'"
 
-# Check if this is a release commit that didn't get processed
-if [[ "$latest_commit" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-    version=$(echo "$latest_commit" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
-    echo "Found unprocessed release commit for version: $version"
+# Check if it's a merge commit
+if [[ "$latest_commit" =~ ^Merge\ pull\ request\ #([0-9]+) ]]; then
+    pr_number=$(echo "$latest_commit" | sed -n 's/.*#\([0-9]*\).*/\1/p')
+    echo "This is a merge commit for PR #$pr_number"
 
-    # Check if tag already exists
-    if git tag -l "v$version" | grep -q "v$version"; then
-        echo "✅ Tag v$version already exists"
-    else
-        echo "❌ Tag v$version is missing - creating it now"
+    # Check if it was a release PR
+    if command -v gh >/dev/null 2>&1; then
+        echo "Checking PR details..."
+        pr_info=$(gh pr view $pr_number --json labels,title,headRefName,state 2>/dev/null || echo "")
 
-        # Create the tag
-        git tag -a "v$version" -m "Release v$version"
-        git push origin "v$version"
-        echo "✅ Created and pushed tag v$version"
+        if [ -n "$pr_info" ]; then
+            pr_title=$(echo "$pr_info" | jq -r '.title // ""')
+            pr_labels=$(echo "$pr_info" | jq -r '.labels[]?.name // ""' | tr '\n' ' ')
+            pr_branch=$(echo "$pr_info" | jq -r '.headRefName // ""')
+            pr_state=$(echo "$pr_info" | jq -r '.state // ""')
 
-        # Create GitHub release if gh CLI is available
-        if command -v gh >/dev/null 2>&1; then
-            echo "Creating GitHub release..."
+            echo "  PR Title: $pr_title"
+            echo "  PR Labels: $pr_labels"
+            echo "  PR Branch: $pr_branch"
+            echo "  PR State: $pr_state"
 
-            # Extract release notes if available
-            if [ -f CHANGELOG.md ]; then
-                # Try to extract release notes for this version
-                awk "/^# Changelog for v$version/,/^# Changelog for v[0-9]/ {if (!/^# Changelog for v[0-9]/ || /^# Changelog for v$version/) print}" CHANGELOG.md > release_notes.md
-                if [ -s release_notes.md ]; then
-                    tail -n +2 release_notes.md > release_notes_clean.md
-                    gh release create "v$version" --title "Release v$version" --notes-file release_notes_clean.md
+            # Check if this was a release PR
+            if [[ "$pr_title" =~ ^Release\ v[0-9]+\.[0-9]+\.[0-9]+$ ]] || echo "$pr_labels" | grep -q "release"; then
+                version=$(echo "$pr_title" | sed -n 's/^Release v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p')
+                echo "✅ This WAS a release PR for version: $version"
+
+                # Check if the release was actually created
+                if git tag -l "v$version" | grep -q "v$version"; then
+                    echo "✅ Git tag v$version exists"
                 else
-                    gh release create "v$version" --title "Release v$version" --notes "Automated release v$version"
+                    echo "❌ Git tag v$version is missing"
+
+                    # Offer to create the tag
+                    echo "Would you like to create the missing tag? (y/n)"
+                    read -r create_tag
+                    if [[ $create_tag == "y" || $create_tag == "Y" ]]; then
+                        git tag -a "v$version" -m "Release v$version"
+                        git push origin "v$version"
+                        echo "✅ Created and pushed tag v$version"
+                    fi
+                fi
+
+                # Check if GitHub release exists
+                if gh release view "v$version" >/dev/null 2>&1; then
+                    echo "✅ GitHub release v$version exists"
+                else
+                    echo "❌ GitHub release v$version is missing"
+
+                    # Offer to create the release
+                    echo "Would you like to create the missing GitHub release? (y/n)"
+                    read -r create_release
+                    if [[ $create_release == "y" || $create_release == "Y" ]]; then
+                        gh release create "v$version" \
+                            --title "Release v$version" \
+                            --notes "Automated release v$version" \
+                            --latest
+                        echo "✅ Created GitHub release v$version"
+                    fi
                 fi
             else
-                gh release create "v$version" --title "Release v$version" --notes "Automated release v$version"
+                echo "❌ This was NOT a release PR"
             fi
-
-            echo "✅ GitHub release created for v$version"
         else
-            echo "⚠️  GitHub CLI not available - you'll need to create the release manually"
+            echo "❌ Could not fetch PR information"
         fi
+    else
+        echo "❌ GitHub CLI (gh) not available"
     fi
-
-    # Clean up the release branch
-    branch_name="release/v$version"
-    if git ls-remote --heads origin "$branch_name" | grep -q "$branch_name"; then
-        git push origin --delete "$branch_name" || echo "Could not delete branch"
-        echo "🧹 Cleaned up release branch: $branch_name"
-    fi
-
 else
-    echo "Current commit is not a release commit"
+    echo "This is not a merge commit"
+
+    # Check if it's a direct release commit
+    if [[ "$latest_commit" =~ ^chore:\ prepare\ release\ v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        version=$(echo "$latest_commit" | sed 's/chore: prepare release v\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/')
+        echo "✅ This IS a direct release commit for version: $version"
+    else
+        echo "❌ This is not a release commit"
+    fi
 fi
 
-# Check for any open release PRs that might be stuck
-if command -v gh >/dev/null 2>&1; then
-    echo ""
-    echo "🔍 Checking for stuck release PRs..."
+echo ""
+echo "🔧 RECOMMENDATIONS:"
+echo "==================="
 
-    open_prs=$(gh pr list --state open --label "release" --json number,title,headRefName)
-    if [ "$open_prs" != "[]" ]; then
-        echo "Found open release PRs:"
-        echo "$open_prs" | jq -r '.[] | "PR #\(.number): \(.title) (\(.headRefName))"'
+echo "1. Update your .github/workflows/release.yml with the enhanced detection logic"
+echo "2. The new logic will handle:"
+echo "   - Direct release commits"
+echo "   - Merge commits from release branches"
+echo "   - Merge commits from release PRs"
+echo "   - Recent commits containing release preparation"
+echo ""
+echo "3. Test the fix by triggering a manual release:"
+echo "   gh workflow run release.yml -f release_type=patch"
+echo ""
+echo "4. Monitor the workflow logs to ensure the detection works correctly"
+
+# Check for stuck workflows
+echo ""
+echo "📊 Checking for stuck workflows..."
+if command -v gh >/dev/null 2>&1; then
+    running_workflows=$(gh run list --workflow=release.yml --status=in_progress --limit 5 --json databaseId,conclusion,status,createdAt)
+
+    if [ "$running_workflows" != "[]" ]; then
+        echo "Found running workflows:"
+        echo "$running_workflows" | jq -r '.[] | "ID: \(.databaseId), Status: \(.status), Created: \(.createdAt)"'
 
         echo ""
-        echo "Options:"
-        echo "1. Close stuck PRs: gh pr close <number>"
-        echo "2. Delete stuck branches: git push origin --delete <branch_name>"
-        echo "3. Or let the fixed workflow handle them"
+        echo "Would you like to cancel these workflows? (y/n)"
+        read -r cancel_workflows
+        if [[ $cancel_workflows == "y" || $cancel_workflows == "Y" ]]; then
+            echo "$running_workflows" | jq -r '.[].databaseId' | while read -r run_id; do
+                gh run cancel "$run_id"
+                echo "Cancelled workflow run: $run_id"
+            done
+        fi
     else
-        echo "✅ No stuck release PRs found"
+        echo "No stuck workflows found"
     fi
 fi
 
 echo ""
-echo "🎉 Quick fix completed!"
-echo ""
-echo "Next steps:"
-echo "1. Replace your .github/workflows/release.yml with the fixed version"
-echo "2. Commit and push the updated workflow"
-echo "3. Test with: gh workflow run release.yml -f release_type=patch"
+echo "🎉 Diagnosis complete!"
+echo "Update your workflow file with the enhanced logic to fix the issue."
