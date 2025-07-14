@@ -8,7 +8,7 @@ import (
 )
 
 // Version of the Frank Go SDK
-const Version = "0.0.3"
+const Version = "0.0.4"
 
 // UserType represents the type of user in Frank Auth's three-tier system
 type UserType string
